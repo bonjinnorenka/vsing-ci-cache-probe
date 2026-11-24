@@ -142,8 +142,11 @@ jobs:
           key: probe-setup-node-home-v1
 
       # ---------------------------------------------------------------- C
-      # sccache GHA backend version hash: real sccache binary in the same
-      # rootless-Docker / buildctl arrangement the smoke workflow uses.
+      # sccache GHA backend version hash: the real sccache 0.18.0 binary in
+      # the same rootless-Docker / buildctl arrangement the smoke workflow
+      # uses. `cvprobe-rel` keeps the compile cwd workspace-relative;
+      # `cvprobe-abs` passes this allocation's absolute workdir, the shape
+      # tools print when they resolve $HOME themselves.
       - name: Export GHA cache env
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
@@ -163,11 +166,12 @@ jobs:
             printf 'ACTIONS_CACHE_SERVICE_V2=%s\n' "${ACTIONS_CACHE_SERVICE_V2:-}"
             printf 'ACTIONS_CACHE_URL=%s\n' "${ACTIONS_CACHE_URL:-}"
             printf 'SCCACHE_GHA_ENABLED=on\n'
-            printf 'SCCACHE_GHA_VERSION=cvprobe-v1\n'
           } > "$BK_DIR/sec/sccache_env"
-          chmod 600 "$BK_DIR/sec/sccache_env"
+          printf 'cvprobe-rel\n' > "$BK_DIR/sec/path-rel"
+          printf '%s\n' "$GITHUB_WORKSPACE/.cache/cv-probe-abs" > "$BK_DIR/sec/path-abs"
+          chmod 600 "$BK_DIR/sec/sccache_env" "$BK_DIR/sec/path-rel" "$BK_DIR/sec/path-abs"
           chown -R dockerci:dockerci "$BK_DIR"
-          echo "secret file written: $(wc -l < "$BK_DIR/sec/sccache_env") lines"
+          echo "secret files written"
 
       - name: Start BuildKit (runner-scoped daemon)
         run: |
@@ -178,9 +182,8 @@ jobs:
             bash '"$GITHUB_WORKSPACE"'/tools/ci/colab-docker/start-buildkit.sh \
               "'"$BK_NAME"'" '"$GITHUB_WORKSPACE"' "'"$BK_DIR"'"
           '
-        continue-on-error: true
 
-      - name: Build probe image through BuildKit + sccache GHA
+      - name: sccache probe (workspace-relative path)
         run: |
           set -xeuo pipefail
           su - dockerci -c '
@@ -189,15 +192,40 @@ jobs:
             set -a && . "'"$BK_DIR"'/sec/sccache_env" && set +a
             docker exec -e ACTIONS_CACHE_URL -e ACTIONS_RESULTS_URL \
               -e ACTIONS_RUNTIME_TOKEN -e ACTIONS_CACHE_SERVICE_V2 \
+              -e COLAB_PROBE_PATH_FILE=/run/secrets/path_file \
               "'"$BK_NAME"'" buildctl --addr unix:///run/buildkit/buildkitd.sock build \
               --frontend dockerfile.v0 \
               --local context=/ws --local dockerfile=/ws \
               --opt filename=tools/ci/cv-probe/Dockerfile \
               --opt build-arg:PROBE_RUNNER="'"$RUNNER_NAME"'" \
+              --opt build-arg:SCCACHE_GHA_VERSION_VALUE=cvprobe-rel-v1 \
               --secret id=sccache_env,src=/bk-out/sec/sccache_env \
-              --output type=docker,name=cvprobe:latest,dest=/bk-out/cvprobe.tar \
-              --progress=plain 2>&1 | tee /home/dockerci/cvprobe-'"$COLAB_RUNNER_KEY"'.log | tail -120
-            test "${PIPESTATUS[0]}" -eq 0
+              --secret id=path_file,src=/bk-out/sec/path-rel \
+              --output type=local,dest=/bk-out/rel \
+              --progress=plain 2>&1 | tee /home/dockerci/cvprobe-rel-'"$COLAB_RUNNER_KEY"'.log | grep -aE "PROBE_SCCACHE|Compile requests|Cache hits|Cache misses|Rust cache|Compile requests executed" || true
+          '
+        continue-on-error: true
+
+      - name: sccache probe (allocation-absolute path)
+        run: |
+          set -xeuo pipefail
+          su - dockerci -c '
+            set -e
+            export XDG_RUNTIME_DIR=/run/user/1001 DOCKER_HOST=unix:///run/user/1001/docker.sock
+            set -a && . "'"$BK_DIR"'/sec/sccache_env" && set +a
+            docker exec -e ACTIONS_CACHE_URL -e ACTIONS_RESULTS_URL \
+              -e ACTIONS_RUNTIME_TOKEN -e ACTIONS_CACHE_SERVICE_V2 \
+              -e COLAB_PROBE_PATH_FILE=/run/secrets/path_file \
+              "'"$BK_NAME"'" buildctl --addr unix:///run/buildkit/buildkitd.sock build \
+              --frontend dockerfile.v0 \
+              --local context=/ws --local dockerfile=/ws \
+              --opt filename=tools/ci/cv-probe/Dockerfile \
+              --opt build-arg:PROBE_RUNNER="'"$RUNNER_NAME"'" \
+              --opt build-arg:SCCACHE_GHA_VERSION_VALUE=cvprobe-abs-v1 \
+              --secret id=sccache_env,src=/bk-out/sec/sccache_env \
+              --secret id=path_file,src=/bk-out/sec/path-abs \
+              --output type=local,dest=/bk-out/abs \
+              --progress=plain 2>&1 | tee /home/dockerci/cvprobe-abs-'"$COLAB_RUNNER_KEY"'.log | grep -aE "PROBE_SCCACHE|Compile requests|Cache hits|Cache misses|Rust cache|Compile requests executed" || true
           '
         continue-on-error: true
 
@@ -205,8 +233,10 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
-          log=/home/dockerci/cvprobe-"$COLAB_RUNNER_KEY".log
-          su - dockerci -c "grep -aE 'PROBE_SCCACHE|SCCACHE_GUARD|Compile requests|Cache hits |Cache misses|Finished|ERROR' $log | tail -40" || true
-          echo "PROBE_SCCACHE_LOG_PRESENT=$(test -f "$log" && echo yes || echo no)"
+          for kind in rel abs; do
+            log=/home/dockerci/cvprobe-$kind-"$COLAB_RUNNER_KEY".log
+            echo "=== $kind ($log) ==="
+            su - dockerci -c "grep -aE 'PROBE_SCCACHE|Compile requests|Cache hits|Cache misses|Rust cache|Compile requests executed|Init gha|create gha' $log | tail -20" || true
+          done
           echo "PROBE MARKER runner=$RUNNER_NAME home=$HOME workspace=$GITHUB_WORKSPACE"
           echo "PROBE_RUNNER_CLASS=$COLAB_RUNNER_KEY"
