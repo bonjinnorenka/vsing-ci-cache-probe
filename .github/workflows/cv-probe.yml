@@ -1,0 +1,212 @@
+name: Cache version probe (temporary)
+
+# TEMPORARY PROBE (delete after use): reproduces the Actions Cache version
+# difference between JIT-slot-dependent absolute paths and workspace-relative
+# paths WITHOUT running a real build. The real colab-vsing-smoke bootstrap
+# and sccache install are kept so the slot/rootless-Docker tooling is
+# exercised exactly as in production.
+# Runner-aware: every per-job Docker resource derives from the runner
+# identity key (slot index on the persistent pool, allocation id +
+# generation under resource-jit).
+# The Colab migration is done; this is a manual diagnostic and only runs
+# on workflow_dispatch.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - probe-b
+
+permissions:
+  contents: read
+  actions: write # required for GitHub Actions cache service v2 writes
+
+jobs:
+  lint-helpers:
+    name: shellcheck colab-docker helpers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: shellcheck -S warning tools/ci/colab-docker/*.sh tools/ci/colab-docker/shim/docker
+
+  probe:
+    name: Probe cache versions
+    needs: lint-helpers
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - colab-ci
+      - colab-ci-exclusive
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Environment info
+        run: |
+          set -uo pipefail
+          echo "PROBE runner=$RUNNER_NAME"
+          echo "PROBE HOME=$HOME"
+          echo "PROBE workspace=$GITHUB_WORKSPACE"
+          echo "PROBE runner_temp=$RUNNER_TEMP"
+          uname -a; nproc; free -h | head -2; df -h / | tail -1
+
+      - name: Derive runner-scoped names
+        run: |
+          set -euo pipefail
+          eval "$(bash tools/ci/colab-docker/runner-identity.sh | tee -a "$GITHUB_ENV")"
+          echo "BK_NAME=buildkitd-$COLAB_RUNNER_KEY" >> "$GITHUB_ENV"
+          echo "BK_DIR=/home/dockerci/bk-$COLAB_RUNNER_KEY" >> "$GITHUB_ENV"
+          echo "PROBE_COLAB_RUNNER_KEY=$COLAB_RUNNER_KEY" >> "$GITHUB_ENV"
+
+      - name: Install sccache 0.18.0 into build context (pinned, checksummed)
+        run: |
+          set -euo pipefail
+          mkdir -p tools/ci/colab-smoke/bin
+          tgz="$RUNNER_TEMP/sccache.tar.gz"
+          curl -sSfL --retry 5 --retry-delay 3 --retry-all-errors -o "$tgz" \
+            https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-x86_64-unknown-linux-musl.tar.gz
+          echo "45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89  $tgz" | sha256sum -c -
+          tar xzf "$tgz" --strip-components=1 -C tools/ci/colab-smoke/bin \
+            --wildcards '*/sccache'
+          tools/ci/colab-smoke/bin/sccache --version
+
+      - name: Rootless Docker bootstrap (idempotent, session-locked)
+        run: bash tools/ci/colab-docker/bootstrap-docker.sh
+
+      # ---------------------------------------------------------------- A
+      # actions/cache literal `path:` strings, written and read a second
+      # time from the same JIT slot. home-prefixed paths must be safe even
+      # though $HOME is slot-dependent.
+      - name: Prepare path variants
+        run: |
+          set -euo pipefail
+          mkdir -p .probe/absolute "$HOME/.probe-home" .probe/relative
+          echo "absolute path payload" > .probe/absolute/marker
+          echo "home path payload" > "$HOME/.probe-home/marker"
+          echo "relative path payload" > .probe/relative/marker
+          echo "runner=$RUNNER_NAME" > .probe/absolute/runner
+          echo "runner=$RUNNER_NAME" > "$HOME/.probe-home/runner"
+          ls -la .probe "$HOME/.probe-home"
+
+      - name: Restore absolute workspace path (save)
+        id: abs
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ github.workspace }}/.probe/absolute
+          key: probe-absolute-v1
+
+      - name: Drop absolute copy for restore proof
+        if: steps.abs.outputs.cache-hit == 'true'
+        run: |
+          cat .probe/absolute/runner
+          rm -rf .probe/absolute && mkdir -p .probe/absolute
+
+      - name: Restore absolute workspace path (read back)
+        id: abs-read
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ github.workspace }}/.probe/absolute
+          key: probe-absolute-v1
+
+      - name: Restore home-prefixed path
+        id: home
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.probe-home
+          key: probe-home-v1
+
+      # ---------------------------------------------------------------- B
+      # tools' own printed absolute paths (setup-node / setup-go shape).
+      - name: Restore setup-node style path ($HOME literal)
+        id: nodehome
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: /home/runner/.probe-node
+          key: probe-setup-node-home-v1
+
+      - name: Restore setup-node style path (${{ github.workspace }} literal)
+        id: nodews
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ github.workspace }}/.probe-node
+          key: probe-setup-node-home-v1
+
+      - name: Restore setup-node style path (relative)
+        id: noderel
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .probe-node
+          key: probe-setup-node-home-v1
+
+      # ---------------------------------------------------------------- C
+      # sccache GHA backend version hash: real sccache binary in the same
+      # rootless-Docker / buildctl arrangement the smoke workflow uses.
+      - name: Export GHA cache env
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+            core.exportVariable('ACTIONS_CACHE_SERVICE_V2', process.env.ACTIONS_CACHE_SERVICE_V2 || '');
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+
+      - name: Write GHA env to secret file (never logged)
+        run: |
+          set -euo pipefail
+          mkdir -p "$BK_DIR/sec"
+          {
+            printf 'ACTIONS_RESULTS_URL=%s\n' "$ACTIONS_RESULTS_URL"
+            printf 'ACTIONS_RUNTIME_TOKEN=%s\n' "$ACTIONS_RUNTIME_TOKEN"
+            printf 'ACTIONS_CACHE_SERVICE_V2=%s\n' "${ACTIONS_CACHE_SERVICE_V2:-}"
+            printf 'ACTIONS_CACHE_URL=%s\n' "${ACTIONS_CACHE_URL:-}"
+            printf 'SCCACHE_GHA_ENABLED=on\n'
+            printf 'SCCACHE_GHA_VERSION=cvprobe-v1\n'
+          } > "$BK_DIR/sec/sccache_env"
+          chmod 600 "$BK_DIR/sec/sccache_env"
+          chown -R dockerci:dockerci "$BK_DIR"
+          echo "secret file written: $(wc -l < "$BK_DIR/sec/sccache_env") lines"
+
+      - name: Start BuildKit (runner-scoped daemon)
+        run: |
+          set -euo pipefail
+          su - dockerci -c '
+            set -e
+            export XDG_RUNTIME_DIR=/run/user/1001 DOCKER_HOST=unix:///run/user/1001/docker.sock
+            bash '"$GITHUB_WORKSPACE"'/tools/ci/colab-docker/start-buildkit.sh \
+              "'"$BK_NAME"'" '"$GITHUB_WORKSPACE"' "'"$BK_DIR"'"
+          '
+        continue-on-error: true
+
+      - name: Build probe image through BuildKit + sccache GHA
+        run: |
+          set -xeuo pipefail
+          su - dockerci -c '
+            set -e
+            export XDG_RUNTIME_DIR=/run/user/1001 DOCKER_HOST=unix:///run/user/1001/docker.sock
+            set -a && . "'"$BK_DIR"'/sec/sccache_env" && set +a
+            docker exec -e ACTIONS_CACHE_URL -e ACTIONS_RESULTS_URL \
+              -e ACTIONS_RUNTIME_TOKEN -e ACTIONS_CACHE_SERVICE_V2 \
+              "'"$BK_NAME"'" buildctl --addr unix:///run/buildkit/buildkitd.sock build \
+              --frontend dockerfile.v0 \
+              --local context=/ws --local dockerfile=/ws \
+              --opt filename=tools/ci/cv-probe/Dockerfile \
+              --opt build-arg:PROBE_RUNNER="'"$RUNNER_NAME"'" \
+              --secret id=sccache_env,src=/bk-out/sec/sccache_env \
+              --output type=docker,name=cvprobe:latest,dest=/bk-out/cvprobe.tar \
+              --progress=plain 2>&1 | tee /home/dockerci/cvprobe-'"$COLAB_RUNNER_KEY"'.log | tail -120
+            test "${PIPESTATUS[0]}" -eq 0
+          '
+        continue-on-error: true
+
+      - name: Summarize probe results
+        if: always()
+        run: |
+          set -uo pipefail
+          log=/home/dockerci/cvprobe-"$COLAB_RUNNER_KEY".log
+          su - dockerci -c "grep -aE 'PROBE_SCCACHE|SCCACHE_GUARD|Compile requests|Cache hits |Cache misses|Finished|ERROR' $log | tail -40" || true
+          echo "PROBE_SCCACHE_LOG_PRESENT=$(test -f "$log" && echo yes || echo no)"
+          echo "PROBE MARKER runner=$RUNNER_NAME home=$HOME workspace=$GITHUB_WORKSPACE"
+          echo "PROBE_RUNNER_CLASS=$COLAB_RUNNER_KEY"
